@@ -1,8 +1,8 @@
 import os
 import json
+import re
 import pdfplumber
 import docx
-import re
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -12,12 +12,12 @@ from google import genai
 from google.genai import types
 
 # ==============================
-# 🔑 API KEY (ENV VARIABLE)
+# 🔑 API KEY
 # ==============================
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
+    raise ValueError("GEMINI_API_KEY not set")
 
 client = genai.Client(api_key=api_key)
 
@@ -26,13 +26,9 @@ client = genai.Client(api_key=api_key)
 # ==============================
 app = FastAPI(
     title="Resume Parser API",
-    description="Upload resume (PDF/DOCX) and get structured JSON data",
-    version="1.0"
+    version="2.0"
 )
 
-# ==============================
-# 🌐 CORS (for frontend)
-# ==============================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,7 +59,7 @@ def extract_text_from_pdf(file_path):
 
 def extract_text_from_docx(file_path):
     doc = docx.Document(file_path)
-    return "\n".join([para.text for para in doc.paragraphs])
+    return "\n".join([p.text for p in doc.paragraphs])
 
 
 def extract_text(file_path):
@@ -77,87 +73,112 @@ def extract_text(file_path):
         raise ValueError("Unsupported file format")
 
 
+# ==============================
+# 🧠 TEXT CLEANING
+# ==============================
 def clean_text(text):
     return text.replace("\n\n", "\n").strip()
 
+
+def limit_text(text, max_chars=8000):
+    return text[:max_chars]
+
+
 # ==============================
-# 🤖 GEMINI PARSER
+# 🤖 PROMPT
 # ==============================
-def ats_extractor(resume_data):
-    system_prompt = (
-    "Extract resume details and return ONLY valid JSON.\n\n"
-    "Format strictly like this:\n"
+system_prompt = (
+    "You are a resume parser.\n\n"
+    "Extract structured data and return ONLY valid JSON.\n\n"
+    "Rules:\n"
+    "- No explanation\n"
+    "- No extra text\n"
+    "- No markdown\n"
+    "- No trailing commas\n"
+    "- All strings must be in double quotes\n\n"
+    "Output format:\n"
     "{\n"
     '  "full_name": "",\n'
     '  "email": "",\n'
     '  "github": "",\n'
     '  "linkedin": "",\n'
-    '  "employment_details": [\n'
-    '    {"title": "", "company": "", "duration": ""}\n'
-    "  ],\n"
+    '  "employment_details": [],\n'
     '  "technical_skills": [],\n'
     '  "soft_skills": []\n'
-    "}\n\n"
-    "No explanation. No extra text. Only JSON."
+    "}"
 )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=resume_data,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.0,
-            max_output_tokens=1500,
-            response_mime_type="application/json"
-        )
-    )
-
-    return response.text
-
+# ==============================
+# 🛡️ SAFE JSON PARSER
+# ==============================
 def safe_json_parse(text):
     try:
         return json.loads(text)
     except:
-        # Extract JSON part using regex
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
-            return json.loads(match.group())
-        else:
-            raise ValueError("Invalid JSON from model")
+            json_str = match.group()
+            json_str = json_str.replace("\n", " ").replace("\t", " ")
+            return json.loads(json_str)
+
+    raise ValueError("Invalid JSON from model")
+
+
+# ==============================
+# 🔁 RETRY LOGIC
+# ==============================
+def ats_extractor_with_retry(text):
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=text,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.0,
+                    response_mime_type="application/json"
+                )
+            )
+
+            result = response.text
+
+            return safe_json_parse(result)
+
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed:", e)
+
+    raise ValueError("Model failed to return valid JSON")
+
 
 # ==============================
 # 📤 UPLOAD ENDPOINT
 # ==============================
-@app.post("/upload", summary="Upload Resume")
+@app.post("/upload")
 async def upload_resume(file: UploadFile = File(...)):
 
-    # Validate file type
     if not file.filename.endswith((".pdf", ".docx")):
         return JSONResponse(
             status_code=400,
-            content={"error": "Only PDF and DOCX files are supported"}
+            content={"error": "Only PDF and DOCX files supported"}
         )
 
-    # Save file temporarily
     file_path = f"temp_{file.filename}"
 
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
     try:
-        # Extract text
         raw_text = extract_text(file_path)
         cleaned_text = clean_text(raw_text)
+        limited_text = limit_text(cleaned_text)
 
-        if not cleaned_text:
+        if not limited_text:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Could not extract text (maybe scanned PDF?)"}
+                content={"error": "Could not extract text"}
             )
 
-        # Parse with Gemini
-        result = ats_extractor(cleaned_text)
-        data = safe_json_parse(result)
+        data = ats_extractor_with_retry(limited_text)
 
         return {
             "success": True,
@@ -172,6 +193,5 @@ async def upload_resume(file: UploadFile = File(...)):
         )
 
     finally:
-        # Delete temp file
         if os.path.exists(file_path):
             os.remove(file_path)
