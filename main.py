@@ -2,6 +2,7 @@ import os
 import json
 import pdfplumber
 import docx
+import re
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -84,16 +85,21 @@ def clean_text(text):
 # ==============================
 def ats_extractor(resume_data):
     system_prompt = (
-        "Extract the following details from the resume:\n"
-        "1. full_name\n"
-        "2. email\n"
-        "3. github\n"
-        "4. linkedin\n"
-        "5. employment_details (list with title, company, duration)\n"
-        "6. technical_skills (list)\n"
-        "7. soft_skills (list)\n\n"
-        "Return ONLY valid JSON. No explanation."
-    )
+    "Extract resume details and return ONLY valid JSON.\n\n"
+    "Format strictly like this:\n"
+    "{\n"
+    '  "full_name": "",\n'
+    '  "email": "",\n'
+    '  "github": "",\n'
+    '  "linkedin": "",\n'
+    '  "employment_details": [\n'
+    '    {"title": "", "company": "", "duration": ""}\n'
+    "  ],\n"
+    '  "technical_skills": [],\n'
+    '  "soft_skills": []\n'
+    "}\n\n"
+    "No explanation. No extra text. Only JSON."
+)
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -107,6 +113,17 @@ def ats_extractor(resume_data):
     )
 
     return response.text
+
+def safe_json_parse(text):
+    try:
+        return json.loads(text)
+    except:
+        # Extract JSON part using regex
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        else:
+            raise ValueError("Invalid JSON from model")
 
 # ==============================
 # 📤 UPLOAD ENDPOINT
@@ -140,7 +157,7 @@ async def upload_resume(file: UploadFile = File(...)):
 
         # Parse with Gemini
         result = ats_extractor(cleaned_text)
-        data = json.loads(result)
+        data = safe_json_parse(result)
 
         return {
             "success": True,
